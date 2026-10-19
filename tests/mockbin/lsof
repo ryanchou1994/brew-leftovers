@@ -1,0 +1,4 @@
+#!/bin/bash
+# Mock lsof: prints whatever the test case put in $MOCK_STATE/lsof (default: one harmless entry).
+if [ -f "$MOCK_STATE/lsof" ]; then cat "$MOCK_STATE/lsof"; else printf 'p1\nn/dev/null\n'; fi
+exit 0

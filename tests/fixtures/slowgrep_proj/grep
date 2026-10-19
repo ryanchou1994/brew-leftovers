@@ -1,0 +1,5 @@
+#!/bin/bash
+# Slows down only the project-folder scan (grep called with -r and -I but not -o); everything else runs normally.
+hr=0; hi=0; ho=0; for a in "$@"; do [ "$a" = -r ] && hr=1; [ "$a" = -I ] && hi=1; [ "$a" = -o ] && ho=1; done
+[ "$hr$hi$ho" = 110 ] && sleep 8
+exec /usr/bin/grep "$@"

@@ -1,0 +1,19 @@
+name: ci
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck and coreutils (gtimeout for the timeout cases)
+        run: brew install shellcheck coreutils
+      - name: shellcheck
+        run: shellcheck -S warning brew-leftovers tests/mockbin/brew tests/mockbin/lsof tests/fixtures/*/* tests/run.sh
+      - name: macOS bash 3.2 syntax check
+        run: /bin/bash -n brew-leftovers
+      - name: tests
+        run: bash tests/run.sh

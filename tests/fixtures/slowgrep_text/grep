@@ -1,0 +1,5 @@
+#!/bin/bash
+# Slows down only the config-file text scan (grep called with both -r and -o); everything else runs normally.
+hr=0; ho=0; for a in "$@"; do [ "$a" = -r ] && hr=1; [ "$a" = -o ] && ho=1; done
+[ "$hr$ho" = 11 ] && sleep 8
+exec /usr/bin/grep "$@"

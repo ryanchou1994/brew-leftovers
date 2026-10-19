@@ -1,0 +1,557 @@
+#!/usr/bin/env bash
+#:  * `leftovers` [`--json`] [<formula> ...]:
+#:    Before or after `brew uninstall`: find out who, outside Homebrew,
+#:    still uses a formula. With no arguments it checks everything
+#:    `brew autoremove --dry-run` would remove; with names it checks those
+#:    formulae. Read-only: it never removes or changes anything.
+#:
+#:        --json  print one machine-readable JSON object instead of text
+#
+# brew-leftovers — https://github.com/ryanchou1994/brew-leftovers — MIT
+#
+# Why: `brew uninstall` also removes dependencies that were "only installed for" the removed
+# formula, but Homebrew's dependency graph cannot see users outside Homebrew: pipx and project
+# virtualenvs, launchd jobs, shell and tool configs, scripts, compiled apps, git hooks.
+# Setting HOMEBREW_NO_AUTOREMOVE=1 stops the bleeding, but then nobody tells you which leftovers
+# are safe to remove. This script answers that question, and errs towards "keep".
+#
+# Verdicts (every line carries a stable ASCII label; --json uses the same strings):
+#   in-use         users found (evidence listed)                      -> keep
+#   unverified     a brew query or a scan failed / timed out           -> keep
+#   keep           no users found, but it provides commands or data    -> keep by default
+#   removable      library only, no users found in scanned locations  -> may be removed after confirming
+#   not-installed  Homebrew has nothing by that name
+#   cask           an app (cask); only formulae are checked            -> keep
+#
+# Environment (all optional):
+#   BREW_LEFTOVERS_PROJECT_ROOTS  colon-separated project folders (default: Desktop:Documents:Developer:Projects:code:src that exist)
+#   BREW_LEFTOVERS_SYSTEM_ROOTS   colon-separated system folders (default: /Applications:/Library/LaunchAgents:/Library/LaunchDaemons; "" = skip)
+#   BREW_LEFTOVERS_EXTRA_ROOTS    colon-separated extra folders to scan for text references and compiled binaries
+#   BREW_LEFTOVERS_SCAN_TIMEOUT   seconds per scan group (default 240); a timeout turns the verdict into "unverified"
+#   BREW_LEFTOVERS_BREW / BREW_LEFTOVERS_PREFIX   test hooks (mock brew / alternative prefix); do not set normally
+#
+# Lineage: evolved from a private script that went through two adversarial review rounds (95 cases) in 2026-09;
+# v1.0.0 adds English output, --json, "mark as wanted" suggestions and git-hook / pre-commit scanning.
+set -uo pipefail
+VERSION="1.0.0"
+US=$'\x1f'   # field separator for the intermediate records (never appears in paths)
+
+usage() {
+  cat <<EOF
+Usage: brew leftovers [--json] [<formula> ...]
+       brew-leftovers [--json] [<formula> ...]
+
+Checks which formulae \`brew autoremove\` would remove (no arguments) or the given formulae,
+and reports who outside Homebrew still uses them. Read-only: nothing is ever removed.
+
+Options:
+  --json       print one machine-readable JSON object (schema_version 1)
+  --version    print the version
+  -h, --help   this help
+
+Exit status: 0 the check ran (see the verdicts); 2 it could not run (no brew, bad arguments, not macOS).
+EOF
+}
+die() { echo "brew-leftovers: $*" >&2; exit 2; }
+
+JSON=0; cands=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --json) JSON=1 ;;
+    -h|--help) usage; exit 0 ;;
+    --version) echo "brew-leftovers ${VERSION}"; exit 0 ;;
+    --) shift; while [ "$#" -gt 0 ]; do cands+=("$1"); shift; done; break ;;
+    -*) usage >&2; die "unknown option: $1" ;;
+    *) cands+=("$1") ;;
+  esac
+  shift
+done
+MODE="explicit"; [ "${#cands[@]}" -eq 0 ] && MODE="autoremove-list"
+
+[ "$(uname -s 2>/dev/null)" = Darwin ] || die "v${VERSION} supports macOS only (it relies on plutil, Mach-O parsing and BSD stat); Linuxbrew is not supported yet."
+if [ "$JSON" = 1 ] && ! python3 -c 1 >/dev/null 2>&1; then die "--json needs a working python3 (none found on PATH)."; fi
+
+BREW="${BREW_LEFTOVERS_BREW:-}"
+if [ -z "$BREW" ]; then
+  for b in "$(command -v brew 2>/dev/null)" /opt/homebrew/bin/brew /usr/local/bin/brew; do [ -n "$b" ] && [ -x "$b" ] && { BREW="$b"; break; }; done
+fi
+[ -n "$BREW" ] && [ -x "$BREW" ] || die "cannot find brew (looked at PATH, /opt/homebrew/bin, /usr/local/bin)."
+PREFIX="${BREW_LEFTOVERS_PREFIX:-${HOMEBREW_PREFIX:-$("$BREW" --prefix 2>/dev/null)}}"
+[ -n "$PREFIX" ] || die "cannot determine the Homebrew prefix."
+export HOMEBREW_NO_AUTOREMOVE=1   # our own brew calls must never trigger autoremove
+export LC_ALL=C                    # everything we match is a byte string; makes grep ~1/3 faster
+TO="${BREW_LEFTOVERS_SCAN_TIMEOUT:-240}"
+TIMEOUT_BIN=""
+for t in timeout gtimeout "${PREFIX}/bin/gtimeout"; do command -v "$t" >/dev/null 2>&1 && { TIMEOUT_BIN="$t"; break; }; done
+run_to() { if [ -n "$TIMEOUT_BIN" ]; then "$TIMEOUT_BIN" "$TO" "$@"; else "$@"; fi; }
+G_WARN=""; [ -z "$TIMEOUT_BIN" ] && G_WARN="no timeout protection (timeout/gtimeout not found); "
+NOTES=""
+exists_list() {  # args: candidate paths; prints the ones that exist (symlinks replaced by their targets, directories too)
+  local p t
+  for p in "$@"; do
+    [ -n "$p" ] && [ -e "$p" ] || continue
+    if [ -L "$p" ]; then t=$(readlink -f "$p" 2>/dev/null) && [ -e "$t" ] && printf '%s\n' "$t"; else printf '%s\n' "$p"; fi
+  done
+}
+split_colon() { local IFS=':'; local r; for r in $1; do printf '%s\n' "$r"; done; }
+json_out() {   # minimal JSON for the empty case (no python needed)
+  printf '{"schema_version":1,"tool":"brew-leftovers","version":"%s","mode":"%s","brew_prefix":"%s","results":[],"summary":{"in-use":0,"unverified":0,"keep":0,"removable":0,"not-installed":0,"cask":0},"warnings":[],"suggestions":{"mark_wanted":null,"mark_wanted_if_keeping":null,"reinstall":null,"remove_after_confirming":null},"scanned":{"project_roots":[],"not_scanned":[]},"broken_python_envs":[]}\n' "$VERSION" "$MODE" "$(printf '%s' "$PREFIX" | sed 's/["\\]/\\&/g')"
+}
+
+# ── candidates: arguments, or the autoremove dry-run list ──
+if [ "$MODE" = autoremove-list ]; then
+  dry=$("$BREW" autoremove --dry-run 2>&1); rc=$?
+  [ "$rc" -eq 0 ] || die "brew autoremove --dry-run failed (rc=${rc}): ${dry}"
+  while IFS= read -r line; do
+    case "$line" in ""|"==>"*|Warning*|Error*) continue ;; esac
+    cands+=("$line")
+  done <<< "$dry"
+fi
+if [ "${#cands[@]}" -eq 0 ]; then
+  if [ "$JSON" = 1 ]; then json_out; else echo "✓ Nothing to check: brew autoremove --dry-run lists no leftovers."; fi
+  exit 0
+fi
+[ "$JSON" = 1 ] || echo "Checking ${#cands[@]} formula(e) (read-only; scans project folders, config files and apps; usually a few minutes, longer with large project folders)…"
+TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+
+# ── step 1: per-formula data from brew (parallel arrays: macOS ships bash 3.2) ──
+GENERIC_SHARE=" man doc info locale zsh bash-completion fish aclocal pkgconfig applications icons mime emacs vim licenses "
+n=${#cands[@]}
+C_SKIP=(); C_CASK=(); C_WARN=(); C_BINS=(); C_LINKED=(); C_DATA=(); C_REAL=(); C_ONREQ=()
+for ((i=0; i<n; i++)); do
+  f="${cands[i]}"; C_SKIP[i]=0; C_CASK[i]=0; C_WARN[i]=""; C_BINS[i]=""; C_LINKED[i]=0; C_DATA[i]=0; C_REAL[i]="$f"; C_ONREQ[i]="unknown"
+  : > "$TMP/ev$i"
+  # not a formula? maybe a cask (brew list --versions <cask> exits 1 with no output)
+  vl=$("$BREW" list --versions "$f" 2>/dev/null) || { C_SKIP[i]=1; "$BREW" list --cask --versions "$f" >/dev/null 2>&1 && C_CASK[i]=1; continue; }
+  real=$(printf '%s\n' "$vl" | awk 'NR==1{print $1}'); [ -n "$real" ] || real="$f"; C_REAL[i]="$real"
+  fs="${real##*/}"; fa="${f##*/}"   # canonical short name / the name the user gave (aliases like python -> python@3.14, tap full names)
+  uses=$("$BREW" uses --installed "$f" 2>/dev/null); urc=$?
+  if [ "$urc" -ne 0 ]; then C_WARN[i]="${C_WARN[i]}brew uses failed (rc=${urc}); "
+  elif [ -n "$uses" ]; then while IFS= read -r u; do [ -n "$u" ] && printf 'brew-dependents%s%s\n' "$US" "$u" >> "$TMP/ev$i"; done <<< "$uses"; fi
+  files=$("$BREW" list "$f" 2>/dev/null); lrc=$?
+  [ "$lrc" -ne 0 ] && C_WARN[i]="${C_WARN[i]}brew list failed, no file list (rc=${lrc}); "
+  fc=$(sed -n 's|.*/Cellar/\([^/]*\)/.*|\1|p' <<< "$files" | head -1)   # Cellar directory name (aliases/old names may differ from --versions)
+  P="$TMP/p$i"; : > "$P"; E="$TMP/e$i"; : > "$E"; : > "$TMP/a$i"
+  for nm in "$fs" "$fa" $fc; do
+    printf '%s\n' "${PREFIX}/opt/${nm}/" "${PREFIX}/Cellar/${nm}/" "/opt/${nm}/" "--prefix ${nm})" "--prefix ${nm}\"" "--prefix ${nm}/" "--prefix ${nm} " >> "$P"
+    for sfx in '"' "'" ' ' ':' ')' ';' ',' '}' ']' '<'; do printf '%s\n' "/opt/${nm}${sfx}" >> "$P"; done   # path followed by quote/space/colon…
+    en=$(printf '%s' "$nm" | sed 's/[][\.*^$+?(){}|/]/\\&/g'); printf '%s\n' "/opt/${en}$" "--prefix ${en}$" >> "$E"   # end of line (grep -E)
+    printf '%s\n' "/opt/${nm}" "--prefix ${nm}" >> "$TMP/a$i"   # anchors for the project scan (suffix filtering happens per candidate)
+  done
+  bins=""; ndata=0
+  while IFS= read -r fp; do
+    [ -n "$fp" ] || continue
+    rel="${fp#*/Cellar/*/*/}"; [ "$rel" = "$fp" ] && continue          # path relative to Cellar/<name>/<version>/
+    top="${rel%%/*}"; base="${fp##*/}"
+    case "$top" in
+      bin|sbin)
+        bins="${bins} ${base}"
+        if [ -e "${PREFIX}/${top}/${base}" ] || [ -L "${PREFIX}/${top}/${base}" ]; then C_LINKED[i]=1; printf '%s\n' "${PREFIX}/${top}/${base}" >> "$P"; fi ;;
+      lib)
+        case "$base" in *.dylib|*.so|*.bundle) printf '%s\n' "${PREFIX}/${rel}" >> "$P"; case "$base" in *.dylib) printf '%s\n' "@rpath/${base}" >> "$P" ;; esac ;; esac
+        case "$rel" in lib/*/*) sub="${rel#lib/}"; sub="${sub%%/*}"; case "$sub" in pkgconfig|cmake) ;; *) printf '%s\n' "${PREFIX}/lib/${sub}/" >> "$P" ;; esac ;; esac ;;
+      share)
+        d="${rel#share/}"; d="${d%%/*}"; ndata=$((ndata+1))
+        case "$GENERIC_SHARE" in *" $d "*) [ "$ndata" -le 40 ] && printf '%s\n' "${PREFIX}/${rel}" >> "$P" ;; *) printf '%s\n' "${PREFIX}/share/${d}/" "/share/${d}/" >> "$P" ;; esac ;;
+      etc)
+        e="${rel#etc/}"; e="${e%%/*}"; ndata=$((ndata+1)); printf '%s\n' "${PREFIX}/etc/${e}" >> "$P" ;;
+      Frameworks)
+        fw="${rel#Frameworks/}"; fw="${fw%%/*}"; printf '%s\n' "${PREFIX}/Frameworks/${fw}/" >> "$P" ;;
+      libexec) printf '%s\n' "${PREFIX}/opt/${fs}/libexec/" >> "$P" ;;
+    esac
+  done <<< "$files"
+  printf '%s\n' "${PREFIX}/etc/${fs}/" >> "$P"   # config created after install (not in brew list), e.g. ca-certificates' cert.pem
+  sort -u "$P" -o "$P"
+  C_BINS[i]=$(printf '%s\n' $bins | sort -u | tr '\n' ' ' | sed 's/ *$//')
+  [ "$ndata" -gt 0 ] && C_DATA[i]=1
+done
+
+# ── installed_on_request (for the "mark as wanted" suggestions; only printed, never executed) ──
+TAB_OK=0; "$BREW" tab --help >/dev/null 2>&1 && TAB_OK=1
+if [ "$MODE" = autoremove-list ]; then
+  for ((i=0; i<n; i++)); do [ "${C_SKIP[i]}" = 0 ] && C_ONREQ[i]=false; done   # by definition: autoremove only lists what was not requested
+elif [ "$TAB_OK" = 1 ]; then
+  names=(); for ((i=0; i<n; i++)); do [ "${C_SKIP[i]}" = 0 ] && names+=("${cands[i]}"); done
+  if [ "${#names[@]}" -gt 0 ]; then
+    if info=$("$BREW" info --json=v2 "${names[@]}" 2>/dev/null) && python3 -c 1 >/dev/null 2>&1; then
+      onreq=$(printf '%s' "$info" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+for f in d.get("formulae", []):
+    inst = f.get("installed") or []
+    v = "true" if inst and inst[-1].get("installed_on_request") else "false"
+    for k in (f.get("name"), f.get("full_name")):
+        if k: print("%s\t%s" % (k, v))
+' 2>/dev/null) || onreq=""
+      if [ -n "$onreq" ]; then
+        for ((i=0; i<n; i++)); do
+          [ "${C_SKIP[i]}" = 0 ] || continue
+          for nm in "${C_REAL[i]##*/}" "${C_REAL[i]}" "${cands[i]##*/}" "${cands[i]}"; do
+            v=$(printf '%s\n' "$onreq" | awk -F'\t' -v k="$nm" '$1==k{print $2; exit}'); [ -n "$v" ] && { C_ONREQ[i]="$v"; break; }
+          done
+        done
+      else NOTES="${NOTES}could not read brew tab state (brew info gave no usable JSON); mark-as-wanted suggestions skipped; "; fi
+    else NOTES="${NOTES}could not read brew tab state (brew info failed or python3 unavailable); mark-as-wanted suggestions skipped; "; fi
+  fi
+fi
+
+# ── step 2: Python environments (pipx, project .venv, poetry/uv/virtualenvs, pre-commit) ──
+proj_roots=()
+while IFS= read -r r; do proj_roots+=("$r"); done < <(
+  if [ -n "${BREW_LEFTOVERS_PROJECT_ROOTS+x}" ]; then pr_list=(); while IFS= read -r x; do pr_list+=("$x"); done < <(split_colon "$BREW_LEFTOVERS_PROJECT_ROOTS"); exists_list ${pr_list[@]+"${pr_list[@]}"}
+  else exists_list "$HOME/Desktop" "$HOME/Documents" "$HOME/Developer" "$HOME/Projects" "$HOME/code" "$HOME/src"; fi)
+extra_roots=()
+if [ -n "${BREW_LEFTOVERS_EXTRA_ROOTS:-}" ]; then
+  ex_list=(); while IFS= read -r x; do ex_list+=("$x"); done < <(split_colon "$BREW_LEFTOVERS_EXTRA_ROOTS")
+  while IFS= read -r r; do extra_roots+=("$r"); done < <(exists_list ${ex_list[@]+"${ex_list[@]}"})
+fi
+PRE_COMMIT_DIR="${PRE_COMMIT_HOME:-${XDG_CACHE_HOME:-$HOME/.cache}/pre-commit}"
+venv_roots=()
+while IFS= read -r r; do venv_roots+=("$r"); done < <(
+  exists_list "${PIPX_HOME:-$HOME/.local/pipx}/venvs" "$HOME/Library/Application Support/pipx/venvs" "$HOME/.virtualenvs" \
+              "$HOME/Library/Caches/pypoetry/virtualenvs" "$HOME/.local/share/uv" "$HOME/.pyenv" "$PRE_COMMIT_DIR"
+  for r in ${proj_roots[@]+"${proj_roots[@]}"}; do printf '%s\n' "$r"; done)
+: > "$TMP/cfgs"
+if [ "${#venv_roots[@]}" -gt 0 ]; then
+  run_to find "${venv_roots[@]}" -maxdepth 7 \( -name node_modules -o -name .git \) -prune -o -name pyvenv.cfg -type f -print > "$TMP/cfgs" 2>/dev/null
+  [ "$?" -eq 124 ] && G_WARN="${G_WARN}Python environment search timed out; "
+fi
+: > "$TMP/broken"
+while IFS= read -r cfg; do
+  [ -f "$cfg" ] || continue
+  h=$(grep -E '^home *= *' "$cfg" | head -1 | sed -E 's/^home *= *//')
+  case "$h" in "${PREFIX}/"*) [ -e "$h" ] || printf '%s%s%s\n' "$(dirname "$cfg")" "$US" "$h" >> "$TMP/broken" ;; esac
+done < "$TMP/cfgs"
+
+# ── step 3: config files and scripts (file names only, never contents); symlinks resolved to their targets ──
+text_roots=()
+for x in "$HOME"/.local/bin/*; do   # ~/.local/bin: only regular files up to 1 MB (large binaries are handled in step 5)
+  [ -e "$x" ] || continue; t=$(readlink -f "$x" 2>/dev/null) || continue
+  [ -f "$t" ] && [ "$(stat -f %z "$t" 2>/dev/null || echo 0)" -le 1048576 ] && text_roots+=("$t")
+done
+while IFS= read -r r; do text_roots+=("$r"); done < <(exists_list \
+  "$HOME/Library/LaunchAgents" "$HOME/Library/Services" "$HOME/.claude/hooks" "$HOME/.claude/settings.json" "$HOME/.claude.json" \
+  "$HOME/.codex/config.toml" "$HOME/.config" \
+  "$HOME/.zshrc" "$HOME/.zprofile" "$HOME/.zshenv" "$HOME/.zlogin" "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile" \
+  "$HOME/.oh-my-zsh/custom" "$HOME/.zsh" "$HOME/.gitconfig" "$HOME/.ssh/config" "$HOME/.ssh/config.d" \
+  "$HOME/.npmrc" "$HOME/.yarnrc" "$HOME/.yarnrc.yml" "$HOME/.pip" "$HOME/Library/Application Support/pip" "$HOME/.bundle" "$HOME/.gemrc" \
+  "$HOME/.cargo/config" "$HOME/.cargo/config.toml" "$HOME/.R" "$HOME/.docker" "$HOME/.colima" "$HOME/.lima" \
+  /etc/paths /etc/paths.d ${extra_roots[@]+"${extra_roots[@]}"})
+# editors (VS Code / Cursor / VSCodium / Windsurf): settings files only — workspaceStorage/globalStorage are chat logs and databases
+while IFS= read -r x; do text_roots+=("$x"); done < <(for ed in Code Cursor VSCodium Windsurf; do u="$HOME/Library/Application Support/${ed}/User"; [ -d "$u" ] && find "$u" -maxdepth 3 \( -name workspaceStorage -o -name globalStorage -o -name History \) -prune -o \( -name settings.json -o -name tasks.json -o -name mcp.json -o -name launch.json \) -type f -print 2>/dev/null; done)
+# git hooks: <project>/.git/hooks/* (pre-commit hard-codes the Python it was installed with) and a global core.hooksPath
+: > "$TMP/hookfiles"
+if [ "${#proj_roots[@]}" -gt 0 ]; then
+  run_to find "${proj_roots[@]}" -maxdepth 6 \( -name node_modules -o -name .venv -o -name venv \) -prune -o -type d -name .git -print -prune 2>/dev/null \
+    | while IFS= read -r g; do [ -d "$g/hooks" ] && find "$g/hooks" -maxdepth 1 -type f ! -name '*.sample' 2>/dev/null; done > "$TMP/hookdirs"
+  [ "${PIPESTATUS[0]}" -eq 124 ] && G_WARN="${G_WARN}git hook search timed out; "
+  cat "$TMP/hookdirs" >> "$TMP/hookfiles"
+fi
+if command -v git >/dev/null 2>&1; then
+  hp=$(git config --global core.hooksPath 2>/dev/null || true)
+  # shellcheck disable=SC2088  # literal leading "~/" as git prints it, expanded by hand
+  case "$hp" in "~/"*) hp="$HOME/${hp#\~/}" ;; esac
+  [ -n "$hp" ] && [ -d "$hp" ] && find "$hp" -maxdepth 1 -type f ! -name '*.sample' 2>/dev/null >> "$TMP/hookfiles"
+fi
+while IFS= read -r hf; do [ -n "$hf" ] && text_roots+=("$hf"); done < "$TMP/hookfiles"
+sys_roots=()
+sr_list=(); while IFS= read -r x; do sr_list+=("$x"); done < <(split_colon "${BREW_LEFTOVERS_SYSTEM_ROOTS-/Applications:/Library/LaunchAgents:/Library/LaunchDaemons}")
+while IFS= read -r r; do sys_roots+=("$r"); done < <(exists_list ${sr_list[@]+"${sr_list[@]}"})
+for r in ${sys_roots[@]+"${sys_roots[@]}"}; do [ "$r" = /Applications ] || text_roots+=("$r"); done
+# plists (incl. Automator .wflow) are converted to XML first: binary plists store non-ASCII strings as UTF-16, which grep cannot match
+plist_files=()
+while IFS= read -r p; do plist_files+=("$p"); done < <(
+  for r in "$HOME/Library/LaunchAgents" "$HOME/Library/Services" ${sys_roots[@]+"${sys_roots[@]}"}; do
+    [ -d "$r" ] && [ "$r" != /Applications ] && find "$r" -maxdepth 3 \( -name '*.plist' -o -name '*.wflow' -o -name document.wflow \) \( -type f -o -type l \) 2>/dev/null
+  done)
+cron=$(crontab -l 2>/dev/null || true)
+ps_all=$(ps -axo pid=,comm= 2>/dev/null || true)   # executable paths only: full argument strings would match our own command line
+lsof_all=$(run_to lsof -n -Fn 2>/dev/null); lrc=$?
+if [ "$lrc" -eq 124 ]; then G_WARN="${G_WARN}lsof timed out; "; elif [ -z "$lsof_all" ]; then G_WARN="${G_WARN}lsof gave no output (open files unknown); "; fi
+
+# symlinks under ~/.local, ~/bin, ~/.config, LaunchAgents and home dotfiles -> their targets (a link into brew = a user; small text targets are scanned too)
+: > "$TMP/links"
+while IFS= read -r l; do
+  t=$(readlink -f "$l" 2>/dev/null); if [ -z "$t" ] || [ ! -e "$t" ]; then t=$(readlink "$l" 2>/dev/null) || continue; printf '%s\t%s\n' "$l" "$t" >> "$TMP/links"; continue; fi   # dangling link: its written target is the evidence
+  if [ -d "$t" ]; then printf '%s\t%s/\n' "$l" "$t" >> "$TMP/links"; else printf '%s\t%s\n' "$l" "$t" >> "$TMP/links"
+    [ "$(stat -f %z "$t" 2>/dev/null || echo 0)" -le 1048576 ] && text_roots+=("$t"); fi
+done < <(for r in "$HOME/.local" "$HOME/bin" "$HOME/.config" "$HOME/Library/LaunchAgents"; do [ -d "$r" ] && find "$r" -maxdepth 4 -type l 2>/dev/null; done
+         find "$HOME" -maxdepth 1 -name '.*' -type l 2>/dev/null)
+
+# ── step 4: text files in project folders (one pass for all candidates; ≤1 MB, text, executable/config file types only) ──
+all_pats="$TMP/all"; : > "$all_pats"; all_e="$TMP/alle"; : > "$all_e"
+for ((k=0; k<n; k++)); do [ "${C_SKIP[k]}" = 1 ] || { cat "$TMP/p$k" >> "$all_pats"; cat "$TMP/e$k" >> "$all_e"; }; done
+: > "$TMP/text_hits"
+if [ "${#text_roots[@]}" -gt 0 ] && [ -s "$all_pats" ]; then
+  run_to grep -r -a -o -H -F -f "$all_pats" --exclude='*.bak*' --exclude='*.log' --exclude-dir=logs --exclude-dir=log \
+       --exclude-dir=cache --exclude-dir=Cache --exclude-dir=Caches "${text_roots[@]}" > "$TMP/text_hits" 2>/dev/null
+  [ "$?" -eq 124 ] && G_WARN="${G_WARN}config-file scan timed out; "
+  run_to grep -r -a -o -H -E -f "$all_e" --exclude='*.bak*' --exclude='*.log' --exclude-dir=logs --exclude-dir=log \
+       --exclude-dir=cache --exclude-dir=Cache --exclude-dir=Caches "${text_roots[@]}" >> "$TMP/text_hits" 2>/dev/null
+  [ "$?" -eq 124 ] && G_WARN="${G_WARN}config-file scan timed out; "
+fi
+# project scan: only file types that get executed or read as configuration (adding *.json/*.js/*.ts pulls in data files: 33 s -> 289 s);
+# matched with a few coarse fragments first (system grep slows down dramatically with many patterns), refined per candidate in step 6.
+anch="$TMP/anch"; cat "$all_pats" > "$anch"
+for ((k=0; k<n; k++)); do [ "${C_SKIP[k]}" = 1 ] || cat "$TMP/a$k" >> "$anch"; done
+sort -u "$anch" -o "$anch"
+piv="$TMP/piv"
+awk '{ if (index($0, "/opt/")) print "/opt/"; else if (index($0, "--prefix ")) print "--prefix "; else if (index($0, "@rpath/")) print "@rpath/"; else print }' "$anch" | sort -u > "$piv"
+: > "$TMP/proj_hits"
+if [ "${#proj_roots[@]}" -gt 0 ] && [ -s "$anch" ]; then
+  PEXD=(--exclude-dir=node_modules --exclude-dir=.git --exclude-dir=.venv --exclude-dir=venv --exclude-dir=__pycache__
+        --exclude-dir=.next --exclude-dir=dist --exclude-dir=build --exclude-dir=DerivedData --exclude-dir=target)
+  run_to grep -r -I -H -F -f "$piv" \
+    --include='*.sh' --include='*.bash' --include='*.zsh' --include='*.command' --include='*.py' --include='*.toml' \
+    --include='*.cfg' --include='*.ini' --include='*.env' --include='.env*' --include='Makefile' --include='*.mk' \
+    --include='*.plist' --include='Brewfile' --include='*.yml' --include='*.yaml' --include='CMakeLists.txt' --include='*.cmake' \
+    --include='*.rb' --include='Gemfile' --include='*.gemspec' --include='Dockerfile' --include='*.conf' --include='*.service' \
+    --include='justfile' --include='Rakefile' --include='Procfile' --include='package.json' --include='settings.json' \
+    --include='settings.local.json' --include='tasks.json' --include='launch.json' --include='mcp.json' \
+    "${PEXD[@]}" "${proj_roots[@]}" > "$TMP/proj_hits" 2>/dev/null
+  [ "$?" -eq 124 ] && G_WARN="${G_WARN}project-folder scan timed out; "
+  run_to find "${proj_roots[@]}" \( -name node_modules -o -name .git -o -name .venv -o -name venv -o -name DerivedData -o -name build -o -name dist \) -prune \
+    -o -type f ! -name '*.*' -size -1024k -print0 2>/dev/null > "$TMP/noext"   # extension-less scripts, executable or not (`bash bin/deploy` is common)
+  [ -s "$TMP/noext" ] && xargs -0 grep -I -H -F -f "$piv" < "$TMP/noext" >> "$TMP/proj_hits" 2>/dev/null
+fi
+
+# ── step 5: compiled artefacts (Mach-O executables/libraries, .node/.so/.bundle) and symlinks to them; only for candidates that could end up "removable" ──
+nobin_pats="$TMP/nobin"; : > "$nobin_pats"
+for ((k=0; k<n; k++)); do [ "${C_SKIP[k]}" = 1 ] && continue; [ -z "${C_BINS[k]}" ] && [ "${C_DATA[k]}" = 0 ] && cat "$TMP/p$k" >> "$nobin_pats"; done
+: > "$TMP/bin_hits"
+if [ -s "$nobin_pats" ]; then
+  if ! python3 -c 1 >/dev/null 2>&1; then
+    G_WARN="${G_WARN}binary scan skipped (python3 cannot run); "
+  else
+    bin_roots=()
+    for r in ${proj_roots[@]+"${proj_roots[@]}"} ${extra_roots[@]+"${extra_roots[@]}"}; do bin_roots+=("$r"); done
+    while IFS= read -r cfg; do
+      [ -n "$cfg" ] || continue; vd=$(dirname "$cfg"); inproj=0
+      for r in ${bin_roots[@]+"${bin_roots[@]}"}; do case "$vd" in "$r"/*) inproj=1 ;; esac; done
+      [ "$inproj" = 0 ] && bin_roots+=("$vd")
+    done < "$TMP/cfgs"
+    while IFS= read -r r; do bin_roots+=("$r"); done < <(exists_list \
+      "$HOME/.local/bin" "$HOME/.cargo/bin" "$HOME/go/bin" "$HOME/Applications" "$HOME/.rbenv" "$HOME/.pyenv" "$HOME/.asdf" \
+      "$HOME/.local/share/mise" "$HOME/.nvm" "$HOME/.volta" "$HOME/.bun" "$HOME/.gem" "$HOME/.local/share/gem" \
+      "${PREFIX}/lib/node_modules" "${PREFIX}/lib/ruby/gems" ${PREFIX}/lib/python3.*/site-packages)
+    for r in ${sys_roots[@]+"${sys_roots[@]}"}; do [ "$r" = /Applications ] && bin_roots+=("$r"); done
+    run_to python3 - "$nobin_pats" "$TMP/bin_hits" ${bin_roots[@]+"${bin_roots[@]}"} <<'PY'
+import os, sys, struct, stat
+# Mach-O files up to 20 MB are matched whole; bigger ones only by the first 512 KB of each architecture slice
+# (linked library paths live in the load commands near the start). Python bytes matching replaces grep -a, which
+# becomes extremely slow on large binaries with many patterns.
+# Files opened: library-like extensions (.dylib .so .node .bundle .plugin), no extension, or executable bit; symlinks are matched by target path.
+pats = [l.rstrip("\n").encode() for l in open(sys.argv[1], encoding="utf-8") if l.strip()]
+spats = [p.decode() for p in pats]
+out = open(sys.argv[2], "w", encoding="utf-8")
+SKIPDIR = {".git", "__pycache__"}
+OKEXT = {"", ".dylib", ".so", ".node", ".bundle", ".plugin"}
+MAGIC = {b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe", b"\xfe\xed\xfa\xcf", b"\xfe\xed\xfa\xce", b"\xca\xfe\xba\xbe", b"\xca\xfe\xba\xbf"}
+FULL = 20 * 1024 * 1024; HEAD = 512 * 1024
+def regions(fh, size, magic):
+    if size <= FULL:
+        fh.seek(0); yield fh.read(); return
+    if magic in (b"\xca\xfe\xba\xbe", b"\xca\xfe\xba\xbf"):
+        fh.seek(4); n = struct.unpack(">I", fh.read(4))[0]
+        if 0 < n < 32:
+            is64 = magic == b"\xca\xfe\xba\xbf"; ent = 32 if is64 else 20
+            for k in range(n):
+                fh.seek(8 + k * ent); e = fh.read(ent)
+                off = struct.unpack(">Q", e[8:16])[0] if is64 else struct.unpack(">I", e[8:12])[0]
+                if 0 <= off < size:
+                    fh.seek(off); yield fh.read(HEAD)
+            return
+    fh.seek(0); yield fh.read(HEAD)
+def scan(path, st):
+    try:
+        if st.st_size < 4: return
+        with open(path, "rb") as fh:
+            magic = fh.read(4)
+            if magic not in MAGIC: return
+            found = set()
+            for buf in regions(fh, st.st_size, magic):
+                for p in pats:
+                    if p not in found and p in buf: found.add(p)
+            for p in found: out.write("%s:%s\n" % (path, p.decode()))
+    except Exception:
+        pass
+def link(path):
+    try:
+        tgt = os.path.realpath(path)
+        for p in spats:
+            if p.startswith("/") and p in tgt + ("/" if os.path.isdir(tgt) else ""):
+                out.write("%s:%s\n" % (path, p)); return
+    except Exception:
+        pass
+for r in sys.argv[3:]:
+    if os.path.isfile(r):
+        try: scan(r, os.stat(r))
+        except Exception: pass
+        continue
+    for dp, dns, fns in os.walk(r):
+        dns[:] = [d for d in dns if d not in SKIPDIR]
+        for fn in fns + [d for d in dns if os.path.islink(os.path.join(dp, d))]:
+            p = os.path.join(dp, fn)
+            try: st = os.lstat(p)
+            except Exception: continue
+            if stat.S_ISLNK(st.st_mode): link(p); continue
+            if not stat.S_ISREG(st.st_mode): continue
+            ext = os.path.splitext(fn)[1].lower()
+            if ext in OKEXT or ext[1:].isdigit() or (st.st_mode & 0o111): scan(p, st)
+out.close()
+PY
+    prc=$?
+    [ "$prc" -eq 124 ] && G_WARN="${G_WARN}binary scan timed out; "
+    [ "$prc" -ne 0 ] && [ "$prc" -ne 124 ] && G_WARN="${G_WARN}binary scan failed (rc=${prc}); "
+  fi
+fi
+
+# ── step 6: verdict per candidate -> one record line + an evidence file (text and JSON are rendered from these) ──
+add_ev() { local kind="$1"; shift; local it; for it in "$@"; do [ -n "$it" ] && printf '%s%s%s\n' "$kind" "$US" "$it" >> "$TMP/ev$k"; done; }
+rec() { local IFS="$US"; printf '%s\n' "$*" >> "$TMP/rec"; }   # fields: index name canonical verdict warnings commands linked data installed_on_request
+: > "$TMP/rec"
+for ((k=0; k<n; k++)); do
+  f="${cands[k]}"
+  if [ "${C_CASK[k]}" = 1 ]; then rec "$k" "$f" "$f" cask "" "" 0 0 unknown; continue; fi
+  if [ "${C_SKIP[k]}" = 1 ]; then rec "$k" "$f" "$f" not-installed "" "" 0 0 unknown; continue; fi
+  pf="$TMP/p$k"; warn="${C_WARN[k]}"
+  hit=""; while IFS= read -r cfg; do [ -f "$cfg" ] && grep -q -F -f "$pf" "$cfg" && hit="${hit}$(dirname "$cfg")"$'\n'; done < "$TMP/cfgs"
+  [ -n "$hit" ] && while IFS= read -r x; do add_ev python-env "$x"; done <<< "$hit"
+  th=$({ grep -F -f "$pf" "$TMP/text_hits"; grep -E -f "$TMP/e$k" "$TMP/text_hits"; } | cut -d: -f1 | sort -u)
+  if [ -n "$th" ]; then
+    hk=""; cf=""
+    while IFS= read -r x; do
+      [ -n "$x" ] || continue
+      if grep -qxF -- "$x" "$TMP/hookfiles"; then hk="${hk}${x}"$'\n'; else cf="${cf}${x}"$'\n'; fi
+    done <<< "$th"
+    [ -n "$cf" ] && while IFS= read -r x; do add_ev config-file "$x"; done < <(printf '%s' "$cf" | head -6)
+    [ -n "$hk" ] && while IFS= read -r x; do add_ev git-hook "$x"; done < <(printf '%s' "$hk" | head -6)
+  fi
+  for p in ${plist_files[@]+"${plist_files[@]}"}; do plutil -convert xml1 -o - "$p" 2>/dev/null | grep -q -F -f "$pf" && add_ev launchd "$p"; done
+  if grep -q -F -f "$pf" <<< "$cron" || grep -q -E -f "$TMP/e$k" <<< "$cron"; then add_ev crontab "crontab"; fi
+  lk=$(cut -f2 "$TMP/links" | grep -n -F -f "$pf" | cut -d: -f1 | while read -r ln; do sed -n "${ln}p" "$TMP/links" | cut -f1; done | head -4)
+  [ -n "$lk" ] && while IFS= read -r x; do add_ev symlink "$x"; done <<< "$lk"
+  pj=$({ grep -F -f "$pf" "$TMP/proj_hits"; grep -E -f "$TMP/e$k" "$TMP/proj_hits"; } | cut -d: -f1 | sort -u | head -6)
+  [ -n "$pj" ] && while IFS= read -r x; do add_ev project-file "$x"; done <<< "$pj"
+  bh=$(grep -F -f "$pf" "$TMP/bin_hits" | cut -d: -f1 | sort -u | head -6)
+  [ -n "$bh" ] && while IFS= read -r x; do add_ev binary "$x"; done <<< "$bh"
+  pr=$(grep -F -f "$pf" <<< "$ps_all" | grep -v -F 'brew-leftovers' | head -3 | awk '{print $1}')
+  [ -n "$pr" ] && while IFS= read -r x; do add_ev process "PID $x"; done <<< "$pr"
+  grep -q -F -f "$pf" <<< "$lsof_all" && add_ev open-file "lsof"
+  warn="${warn}${G_WARN}"
+  warn=$(printf '%s' "$warn" | tr ';' '\n' | sed 's/^ *//; s/ *$//' | awk 'NF && !seen[$0]++' | tr '\n' ';' | sed 's/;$//; s/;/; /g')
+  if [ -s "$TMP/ev$k" ]; then verdict="in-use"
+  elif [ -n "$warn" ]; then verdict="unverified"
+  elif [ -n "${C_BINS[k]}" ] || [ "${C_DATA[k]}" = 1 ]; then verdict="keep"
+  else verdict="removable"; fi
+  rec "$k" "$f" "${C_REAL[k]}" "$verdict" "$warn" "${C_BINS[k]}" "${C_LINKED[k]}" "${C_DATA[k]}" "${C_ONREQ[k]}"
+done
+
+# suggestion lists (print only — this script never runs brew tab / brew uninstall)
+mark_wanted=""; mark_keep=""; greens=""
+# shellcheck disable=SC2034  # record fields are read positionally; not every field is used here
+while IFS="$US" read -r k name real verdict warn bins linked data onreq; do
+  case "$verdict" in
+    in-use) [ "$onreq" = false ] && [ "$TAB_OK" = 1 ] && mark_wanted="${mark_wanted} ${name}" ;;
+    keep) [ "$onreq" = false ] && [ "$TAB_OK" = 1 ] && mark_keep="${mark_keep} ${name}" ;;
+    removable) greens="${greens} ${name}" ;;
+  esac
+done < "$TMP/rec"
+mark_wanted="${mark_wanted# }"; mark_keep="${mark_keep# }"; greens="${greens# }"
+scanned_desc="brew dependents; Python environments (pipx, project .venv, poetry/uv, pre-commit); ~/.local/bin, LaunchAgents/Daemons, shell and git/ssh/npm/pip configs; git hooks; project folders ($(printf '%s ' ${proj_roots[@]+"${proj_roots[@]}"} | sed "s|$HOME|~|g; s/ *$//")); apps and compiled binaries; running processes; open files; symlinks"
+NOT_SCANNED="other user accounts; external drives; cloud-synced folders not under a project root; uses on other machines"
+
+# ── step 7: render ──
+if [ "$JSON" = 1 ]; then
+  {
+    printf '%s\n' "$VERSION" "$MODE" "$PREFIX" "$G_WARN" "$NOTES" "$mark_wanted" "$mark_keep" "$greens" "$NOT_SCANNED"
+    for r in ${proj_roots[@]+"${proj_roots[@]}"}; do printf 'R%s\n' "$r"; done
+  } > "$TMP/meta"
+  python3 - "$TMP" <<'PY'
+import json, os, sys
+T = sys.argv[1]; US = "\x1f"
+def rd(p): return open(p, encoding="utf-8", errors="replace").read()
+meta = rd(os.path.join(T, "meta")).split("\n")
+version, mode, prefix, gwarn, notes, mw, mk, greens, not_scanned = meta[:9]
+roots = [l[1:] for l in meta[9:] if l.startswith("R")]
+def items(s): return [x.strip() for x in s.split(";") if x.strip()]
+results = []; summary = {"in-use": 0, "unverified": 0, "keep": 0, "removable": 0, "not-installed": 0, "cask": 0}
+for line in rd(os.path.join(T, "rec")).splitlines():
+    k, name, real, verdict, warn, bins, linked, data, onreq = line.split(US)
+    ev = []
+    evp = os.path.join(T, "ev" + k)
+    if os.path.exists(evp):
+        for l in rd(evp).splitlines():
+            kind, item = l.split(US, 1)
+            for e in ev:
+                if e["kind"] == kind: e["items"].append(item); break
+            else: ev.append({"kind": kind, "items": [item]})
+    summary[verdict] += 1
+    results.append({"name": name, "canonical": real, "verdict": verdict, "evidence": ev, "warnings": items(warn),
+                    "provides": {"commands": bins.split(), "linked": linked == "1", "data_files": data == "1"},
+                    "installed_on_request": {"true": True, "false": False}.get(onreq)})
+broken = []
+for l in rd(os.path.join(T, "broken")).splitlines():
+    if US in l:
+        p, h = l.split(US, 1); broken.append({"path": p, "missing_home": h})
+out = {"schema_version": 1, "tool": "brew-leftovers", "version": version, "mode": mode, "brew_prefix": prefix, "results": results,
+       "summary": summary, "warnings": items(gwarn) + items(notes),
+       "suggestions": {"mark_wanted": ("brew tab --installed-on-request " + mw) if mw else None,
+                       "mark_wanted_if_keeping": ("brew tab --installed-on-request " + mk) if mk else None,
+                       "reinstall": ("brew install " + greens) if greens else None,
+                       "remove_after_confirming": ("HOMEBREW_NO_AUTOREMOVE=1 brew uninstall " + greens) if greens else None},
+       "scanned": {"project_roots": roots, "not_scanned": items(not_scanned)}, "broken_python_envs": broken}
+sys.stdout.buffer.write((json.dumps(out, indent=2, ensure_ascii=False) + "\n").encode("utf-8"))
+PY
+  exit 0
+fi
+
+n_red=0; n_warn=0; n_yellow=0; n_green=0; n_skip=0; n_cask=0
+# shellcheck disable=SC2034  # record fields are read positionally; not every field is used here
+while IFS="$US" read -r k name real verdict warn bins linked data onreq; do
+  echo "────────────────────────────────────────"
+  label="$name"; [ "$real" != "$name" ] && label="${name} (formula ${real})"
+  case "$verdict" in
+    cask)
+      echo "⚠️ cask  ${label}: this is an app (cask); brew-leftovers only checks command-line formulae -> keep"
+      echo "     · note: apps can be launched by scripts, schedules or other apps; decide about it separately"; n_cask=$((n_cask+1)) ;;
+    not-installed) echo "⚪ not-installed  ${label}"; n_skip=$((n_skip+1)) ;;
+    in-use)
+      echo "🔴 in-use  ${label}: something still uses it -> keep"; n_red=$((n_red+1))
+      awk -F"$US" '{ if (!($1 in a)) { ord[++c]=$1; a[$1]=$2 } else a[$1]=a[$1] " " $2 } END { for (i=1;i<=c;i++) printf "     · %s: %s\n", ord[i], a[ord[i]] }' "$TMP/ev$k" ;;
+    unverified)
+      echo "⚠️ unverified  ${label}: a check did not complete, so nobody can vouch for it -> keep"
+      echo "     · reason: ${warn}"; n_warn=$((n_warn+1)) ;;
+    keep)
+      if [ -n "$bins" ]; then
+        if [ "$linked" = 1 ]; then echo "🟡 keep  ${label}: no users found in the scanned locations (which does not prove there are none), but it provides commands (${bins}) -> keep by default"
+        else echo "🟡 keep  ${label}: no users found in the scanned locations (which does not prove there are none), but it provides commands (${bins}; not linked into PATH, programs may call it by full path) -> keep by default"; fi
+        echo "     · note: some apps and scripts run a command only when needed, which a file scan cannot see; confirm before removing"
+      else
+        echo "🟡 keep  ${label}: no users found in the scanned locations (which does not prove there are none), but it provides data files (share/etc: shell plugins, completions, certificates, configs) -> keep by default"
+        echo "     · note: such files are loaded by shell configs and other programs in too many ways to scan completely; confirm before removing"
+      fi; n_yellow=$((n_yellow+1)) ;;
+    removable)
+      echo "🟢 removable  ${label}: library only, no users found in the scanned locations -> may be removed (confirm first)"; n_green=$((n_green+1)) ;;
+  esac
+done < "$TMP/rec"
+echo "────────────────────────────────────────"
+echo "Summary: in-use ${n_red} / unverified ${n_warn} / keep ${n_yellow} / removable ${n_green} / not-installed ${n_skip} / cask ${n_cask}"
+if [ -n "$greens" ]; then
+  echo "Scanned: ${scanned_desc}"
+  echo "Not scanned: ${NOT_SCANNED}"
+  echo "Reinstall if removed by mistake: brew install ${greens}"
+  echo "Remove only after confirming (nothing is removed by this script): HOMEBREW_NO_AUTOREMOVE=1 brew uninstall ${greens}"
+fi
+[ -n "$mark_wanted" ] && echo "Mark as wanted (in use) so brew stops listing them as removable: brew tab --installed-on-request ${mark_wanted}"
+[ -n "$mark_keep" ] && echo "If you decide to keep these, mark them as wanted: brew tab --installed-on-request ${mark_keep}"
+[ -n "$NOTES" ] && echo "Note: $(printf '%s' "$NOTES" | sed 's/; $//')"
+if [ -s "$TMP/broken" ]; then
+  echo "────────────────────────────────────────"
+  echo "Also found (unrelated to this check): $(grep -c . "$TMP/broken") broken Python environment(s) — their Homebrew Python is gone; rebuild them before use:"
+  while IFS="$US" read -r d h; do echo "     · ${d} -> missing ${h}"; done < "$TMP/broken"
+fi
+exit 0

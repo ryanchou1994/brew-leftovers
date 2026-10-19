@@ -1,0 +1,44 @@
+#!/bin/bash
+# Mock `brew` for the test suite. Reads its state from the directory in $MOCK_STATE:
+#   prefix        - what `brew --prefix` prints (default /opt/homebrew)
+#   installed     - one formula name per line (`brew list --versions <f>` succeeds for these)
+#   casks         - one cask name per line (`brew list --cask --versions <c>` succeeds for these)
+#   autoremove    - lines printed by `brew autoremove --dry-run`
+#   files/<key>   - output of `brew list <f>` (key = name with / replaced by __)
+#   uses/<key>    - output of `brew uses --installed <f>`
+#   listfail      - if present, `brew list <f>` fails
+#   usesfail      - if present, `brew uses` fails
+#   notab         - if present, `brew tab` is an unknown command (old Homebrew)
+#   onrequest     - names reported as installed_on_request=true by `brew info --json=v2`
+#   infofail      - if present, `brew info` fails
+# Anything the mock does not understand is appended to unexpected/ (the harness reports it).
+# `brew tab <anything but --help>` is recorded in executed_tab: the checker must never run it.
+M="$MOCK_STATE"
+key() { printf '%s' "$1" | sed 's|/|__|g'; }
+has() { [ -f "$M/$1" ] && grep -qxF -- "$2" "$M/$1"; }
+case "$1" in
+  --prefix) if [ -f "$M/prefix" ]; then cat "$M/prefix"; else echo /opt/homebrew; fi ;;
+  autoremove)
+    n=$(grep -c . "$M/autoremove" 2>/dev/null); echo "==> Would autoremove ${n:-0} unneeded formulae:"
+    cat "$M/autoremove" 2>/dev/null; exit 0 ;;
+  list)
+    if [ "$2" = --versions ]; then has installed "$3" && echo "$3 1.0" || exit 1
+    elif [ "$2" = --cask ] && [ "$3" = --versions ]; then has casks "$4" && echo "$4 1.0" || exit 1
+    else [ -f "$M/listfail" ] && { echo "Error: boom" >&2; exit 1; }; cat "$M/files/$(key "$2")" 2>/dev/null; fi ;;
+  uses) [ -f "$M/usesfail" ] && { echo "Error: No available formula" >&2; exit 1; }; cat "$M/uses/$(key "$3")" 2>/dev/null ;;
+  tab)
+    [ -f "$M/notab" ] && { echo "Error: Unknown command: tab" >&2; exit 1; }
+    if [ "$2" = --help ]; then echo "Usage: brew tab [options] installed_formula|installed_cask [...]"; exit 0; fi
+    echo "$*" >> "$M/executed_tab"; exit 0 ;;
+  info)
+    [ -f "$M/infofail" ] && { echo "Error: boom" >&2; exit 1; }
+    shift; [ "$1" = --json=v2 ] && shift
+    printf '{"formulae":['; sep=""
+    for f in "$@"; do
+      has installed "$f" || continue
+      r=false; has onrequest "$f" && r=true
+      printf '%s{"name":"%s","installed":[{"version":"1.0","installed_on_request":%s}]}' "$sep" "$f" "$r"; sep=","
+    done
+    printf '],"casks":[]}\n'; exit 0 ;;
+  *) echo "mock: unexpected $*" >&2; echo "$*" >> "$M/unexpected"; exit 1 ;;
+esac

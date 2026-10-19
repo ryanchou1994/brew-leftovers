@@ -1,0 +1,3 @@
+#!/bin/bash
+# Pretends to be Linux so the "macOS only" guard can be tested.
+case "$1" in -s|"") echo Linux ;; *) exec /usr/bin/uname "$@" ;; esac
