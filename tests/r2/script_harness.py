@@ -16,9 +16,11 @@ def macho(*strs):
 
 def run_case(name, formula, files_rel, home_files=None, prefix=None, arg=None, extra_path=os.path.join(FIX, "lsofok"),
              extra_env=None, cellar_name=None, linked=(), expect=None, xfail=False, mode="args", flags=(),
-             onrequest=False, notab=False, casks=(), infofail=False, installed=True, quiet=False):
-    """Returns the CompletedProcess. Prints one PASS/FAIL/XFAIL/XPASS block per case when `expect` is given."""
+             onrequest=False, notab=False, casks=(), infofail=False, installed=True, quiet=False, chmods=()):
+    """Returns the CompletedProcess. Prints one PASS/FAIL/XFAIL/XPASS block per case when `expect` is given.
+    chmods: [(path relative to the fake HOME, mode)] applied after home_files (e.g. 0 = unreadable); undone before cleanup."""
     home = os.path.realpath(tempfile.mkdtemp(prefix="bl2-home-"))
+    locked = []
     st = os.path.realpath(tempfile.mkdtemp(prefix="bl2-state-"))
     tmpp = None
     try:
@@ -56,6 +58,7 @@ def run_case(name, formula, files_rel, home_files=None, prefix=None, arg=None, e
         for rel, spec in (home_files or {}).items():
             spec = spec(P, home) if callable(spec) else spec
             p = rel if rel.startswith("/") else os.path.join(home, rel)
+            if rel.endswith("/"): os.makedirs(p, exist_ok=True); continue   # trailing slash = (empty) folder
             os.makedirs(os.path.dirname(p), exist_ok=True)
             if isinstance(spec, tuple) and spec[0] == "symlink":
                 os.symlink(spec[1].replace("$HOME", home), p)
@@ -65,6 +68,8 @@ def run_case(name, formula, files_rel, home_files=None, prefix=None, arg=None, e
                 open(p, "wb").write(spec)
             else:
                 open(p, "w").write(spec)
+        for rel, cmode in chmods:   # not `mode`: that name is the run mode parameter
+            cp = os.path.join(home, rel); locked.append(cp); os.chmod(cp, cmode)
         env = {"HOME": home, "PATH": (extra_path + ":" if extra_path else "") + MOCK + ":/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
                "BREW_LEFTOVERS_BREW": os.path.join(MOCK, "brew"), "MOCK_STATE": st, "LANG": "en_US.UTF-8",
                "BREW_LEFTOVERS_SYSTEM_ROOTS": ""}
@@ -90,6 +95,9 @@ def run_case(name, formula, files_rel, home_files=None, prefix=None, arg=None, e
                 if r.unexpected: print("    UNEXPECTED brew calls:", r.unexpected.strip())
         return r
     finally:
+        for cp in reversed(locked):
+            try: os.chmod(cp, 0o755)
+            except OSError: pass
         for d in (home, st, tmpp):
             if d: shutil.rmtree(d, ignore_errors=True)
 

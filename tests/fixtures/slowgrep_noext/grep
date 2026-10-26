@@ -1,0 +1,5 @@
+#!/bin/bash
+# Slows down only the grep over extension-less files (called with -I but without -r); everything else runs normally.
+hr=0; hi=0; for a in "$@"; do [ "$a" = -r ] && hr=1; [ "$a" = -I ] && hi=1; done
+[ "$hr$hi" = 01 ] && sleep 8
+exec /usr/bin/grep "$@"

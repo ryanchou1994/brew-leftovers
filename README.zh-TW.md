@@ -46,7 +46,7 @@ If you decide to keep these, mark them as wanted: brew tab --installed-on-reques
 | 標籤 | 意思 | 怎麼做 |
 |------|------|--------|
 | `in-use` | 找到 Homebrew 以外的使用者，證據列在下面 | 保留 |
-| `unverified` | 某項 brew 查詢或掃描失敗、逾時，沒人能替它擔保 | 保留 |
+| `unverified` | 某項 brew 查詢或掃描失敗、逾時，或讀不到某個檔案／資料夾，沒人能替它擔保 | 保留 |
 | `keep` | 掃描範圍內沒找到使用者，但它提供指令或資料檔（shell 外掛、補完、憑證、設定），程式可能執行當下才用 | 預設保留 |
 | `removable` | 只有程式庫，掃描範圍內沒人用 | 可以考慮刪，由你確認 |
 | `not-installed` | Homebrew 沒有這個名字 | 無 |
@@ -125,6 +125,7 @@ brew leftovers --json [<formula> ...]
 - **「沒找到使用者」只代表「掃描範圍內沒有」。** 其他使用者帳號、外接碟、專案根目錄以外的雲端同步資料夾、別台機器都不在範圍內；而且執行時靠名字呼叫指令的程式在任何檔案裡都看不到痕跡。這就是為什麼有指令的 formula 判 `keep` 而不是 `removable`。
 - **偏向保留。** 指令名是另一個工具名字的前綴（`zzc` 與 `zzc-helper`）會誤判成 `in-use`，這是接受的：往安全的方向錯。
 - **掃描要時間。** 通常幾分鐘，專案資料夾大的話會更久；每組掃描有逾時（`BREW_LEFTOVERS_SCAN_TIMEOUT`，預設 240 秒），逾時會把判定變成 `unverified`，絕不會變成 `removable`。
+- **讀不到的檔案算「沒查過」。** 任何一組掃描讀不到某個檔案或資料夾（權限不足，或 macOS 隱私保護——例如終端機沒開「完整磁碟取用權限」時讀 `~/Desktop`、`~/Documents`），所有還沒被證明 `in-use` 的 formula 都會變成 `unverified`，原因欄會列出第一個讀不到的路徑。給終端機權限或修好權限後再跑一次即可。
 
 環境變數：`BREW_LEFTOVERS_PROJECT_ROOTS`（冒號分隔的專案資料夾）、`BREW_LEFTOVERS_SYSTEM_ROOTS`（預設 `/Applications:/Library/LaunchAgents:/Library/LaunchDaemons`；空字串＝不掃）、`BREW_LEFTOVERS_EXTRA_ROOTS`（額外要掃的資料夾，文字與編譯產物都掃）、`BREW_LEFTOVERS_SCAN_TIMEOUT`。
 
@@ -134,7 +135,7 @@ brew leftovers --json [<formula> ...]
 bash tests/run.sh
 ```
 
-116 個案例全部在假的 `HOME` 裡用 mock `brew` 與 mock `lsof` 跑，不會碰你的 Homebrew。內容包括本腳本私有版本時期的兩輪對抗測試（設定檔藏在奇怪的地方、捷徑化的 dotfiles、含非 ASCII 字串的二進位 plist、含空白的 prefix、壞掉的 `python3`、逾時的掃描），加上為 1.0.0 新功能依規格盲出的 holdout 題。有兩題是預期失敗（`XFAIL`）：一個已知的往保留方向誤判，一個測試夾具的限制（另一題已涵蓋）。測試同樣需要 `coreutils`：沒有 `gtimeout` 時兩題逾時測試會失敗，其餘大多數判定也會變成「無法確認」。
+132 個案例全部在假的 `HOME` 裡用 mock `brew` 與 mock `lsof` 跑，不會碰你的 Homebrew。內容包括本腳本私有版本時期的兩輪對抗測試（設定檔藏在奇怪的地方、捷徑化的 dotfiles、含非 ASCII 字串的二進位 plist、含空白的 prefix、壞掉的 `python3`、逾時的掃描），加上為 1.0.0 新功能依規格盲出的 holdout 題，以及 1.0.1 新增的「讀不到檔案／資料夾」與「搜尋逾時」案例和第二組盲出題（也驗證斷掉的捷徑、空資料夾、怪檔名這類正常情況不會誤報）。有兩題是預期失敗（`XFAIL`）：一個已知的往保留方向誤判，一個測試夾具的限制（另一題已涵蓋）。測試同樣需要 `coreutils`：沒有 `gtimeout` 時兩題逾時測試會失敗，其餘大多數判定也會變成「無法確認」。
 
 ## 授權
 

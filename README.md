@@ -45,7 +45,7 @@ Every result line starts with a stable label; `--json` uses the same strings.
 | Label | Meaning | What to do |
 |-------|---------|------------|
 | `in-use` | Something outside Homebrew uses it; the evidence is listed | keep |
-| `unverified` | A brew query or a scan failed or timed out, so nobody can vouch for it | keep |
+| `unverified` | A brew query or a scan failed, timed out, or could not read a file or folder, so nobody can vouch for it | keep |
 | `keep` | No user found in the scanned locations, but the formula provides commands or data files (shell plugins, completions, certificates, configs) that programs may use only at run time | keep by default |
 | `removable` | Library only, and no user found in the scanned locations | may be removed, after you confirm |
 | `not-installed` | Homebrew has nothing by that name | nothing |
@@ -114,7 +114,7 @@ prints one JSON object (`schema_version` 1). Adding fields will not bump the sch
 {
   "schema_version": 1,
   "tool": "brew-leftovers",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "mode": "autoremove-list",
   "brew_prefix": "/opt/homebrew",
   "results": [
@@ -171,6 +171,7 @@ exit 0
 - **"No users found" means "none in the scanned locations".** Other user accounts, external drives, cloud-synced folders outside your project roots and other machines are not scanned, and programs that call a command by name at run time leave no trace in any file. That is why formulae with commands are `keep`, not `removable`.
 - **It errs towards keeping.** A command name that is a prefix of another tool's name (`zzc` vs `zzc-helper`) can produce a false `in-use`. That is accepted: the safe direction.
 - **Scans take time.** Usually a few minutes, longer with large project folders; each scan group has a timeout (`BREW_LEFTOVERS_SCAN_TIMEOUT`, default 240 s) and a timeout turns the verdict into `unverified`, never into `removable`.
+- **Unreadable files count as "not checked".** If any scan cannot read a file or folder (no permission, or macOS privacy protection, e.g. a terminal without Full Disk Access reading `~/Desktop` or `~/Documents`), every formula not already proven `in-use` becomes `unverified`, and the reason line names the first path it could not read. Give the terminal access, or fix the permission, and run it again.
 
 Environment variables: `BREW_LEFTOVERS_PROJECT_ROOTS` (colon-separated project folders), `BREW_LEFTOVERS_SYSTEM_ROOTS` (`/Applications:/Library/LaunchAgents:/Library/LaunchDaemons` by default; empty string to skip), `BREW_LEFTOVERS_EXTRA_ROOTS` (extra folders to scan for both text references and binaries), `BREW_LEFTOVERS_SCAN_TIMEOUT`.
 
@@ -180,7 +181,7 @@ Environment variables: `BREW_LEFTOVERS_PROJECT_ROOTS` (colon-separated project f
 bash tests/run.sh
 ```
 
-116 cases run against a fake `HOME` with a mock `brew` and mock `lsof`; nothing touches your real Homebrew. They include two adversarial rounds inherited from the private version of this script (config files in unusual places, symlinked dotfiles, binary plists with non-ASCII strings, prefixes with spaces, broken `python3`, scans that time out) plus a holdout set written from the spec for the 1.0.0 additions. Two cases are expected failures and are reported as `XFAIL`: a known over-match that errs towards keeping, and a fixture limitation covered by another case. `coreutils` is needed here too: without `gtimeout` the two timeout cases fail and most verdicts collapse to `unverified`.
+132 cases run against a fake `HOME` with a mock `brew` and mock `lsof`; nothing touches your real Homebrew. They include two adversarial rounds inherited from the private version of this script (config files in unusual places, symlinked dotfiles, binary plists with non-ASCII strings, prefixes with spaces, broken `python3`, scans that time out) plus a holdout set written from the spec for the 1.0.0 additions, and (1.0.1) cases for unreadable files and folders and for timed-out searches, with a second blind holdout set that also checks ordinary oddities (broken symlinks, empty folders, odd file names) do not raise false warnings. Two cases are expected failures and are reported as `XFAIL`: a known over-match that errs towards keeping, and a fixture limitation covered by another case. `coreutils` is needed here too: without `gtimeout` the two timeout cases fail and most verdicts collapse to `unverified`.
 
 ## License
 

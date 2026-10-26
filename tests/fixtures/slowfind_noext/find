@@ -1,0 +1,4 @@
+#!/bin/bash
+# Slows down only the extension-less file search (the one find call that uses -print0); everything else runs normally.
+for a in "$@"; do [ "$a" = -print0 ] && { sleep 8; break; }; done
+exec /usr/bin/find "$@"

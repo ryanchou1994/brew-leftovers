@@ -10,7 +10,7 @@ if ! command -v timeout >/dev/null 2>&1 && ! command -v gtimeout >/dev/null 2>&1
   echo "note: no timeout/gtimeout on PATH; install coreutils first. Without it the tool treats the missing time limit as a warning, so most verdicts collapse to unverified and 13 cases (the two timeout cases R20/R20b plus 11 removable/keep cases) are reported as failures." >&2
 fi
 fail=0
-for s in r1/harness.py r2/script_harness.py r2/script_extra.py holdout/holdout.py; do
+for s in r1/harness.py r2/script_harness.py r2/script_extra.py holdout/holdout.py holdout/holdout_101.py; do
   echo "=== $s"
   if [ -n "${VERBOSE:-}" ]; then python3 "$s"; else python3 "$s" | grep -E '^(### |    \[(FAIL|XPASS)\]|RESULT )'; fi
   rc=${PIPESTATUS[0]}; [ "$rc" -eq 0 ] || fail=1

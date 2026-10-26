@@ -1,0 +1,3 @@
+#!/bin/bash
+# lsof that works and shows nothing interesting.
+printf 'p1\nn/dev/null\n'; exit 0

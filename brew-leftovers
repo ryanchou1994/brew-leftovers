@@ -33,7 +33,7 @@
 # Lineage: evolved from a private script that went through two adversarial review rounds (95 cases) in 2026-09;
 # v1.0.0 adds English output, --json, "mark as wanted" suggestions and git-hook / pre-commit scanning.
 set -uo pipefail
-VERSION="1.0.0"
+VERSION="1.0.1"
 US=$'\x1f'   # field separator for the intermediate records (never appears in paths)
 
 usage() {
@@ -85,6 +85,20 @@ TIMEOUT_BIN=""
 for t in timeout gtimeout "${PREFIX}/bin/gtimeout"; do command -v "$t" >/dev/null 2>&1 && { TIMEOUT_BIN="$t"; break; }; done
 run_to() { if [ -n "$TIMEOUT_BIN" ]; then "$TIMEOUT_BIN" "$TO" "$@"; else "$@"; fi; }
 G_WARN=""; [ -z "$TIMEOUT_BIN" ] && G_WARN="no timeout protection (timeout/gtimeout not found); "
+# A search that could not look everywhere must never let a candidate end up "removable": it turns every verdict that is not
+# in-use into unverified. scan_ok <rc> <what> <stderr file> <normal rc>...: 124 = timed out; any stderr line, or an rc not listed,
+# = could not read part of it (BSD grep exits 2 even when it also matched; BSD xargs exits 1 both for "no match" and for errors,
+# so stderr is the signal). Only the first unreadable path is shown, never file contents.
+scan_ok() {
+  local rc="$1" what="$2" ef="$3" ok cnt ex; shift 3
+  if [ "$rc" -eq 124 ]; then G_WARN="${G_WARN}${what} timed out; "; return 0; fi
+  if [ -s "$ef" ]; then
+    cnt=$(wc -l < "$ef" | tr -d ' '); ex=$(head -1 "$ef" | sed -E 's/^[^:]+: //; s/: [^:]*$//' | sed "s|^$HOME|~|" | tr ';' ',')
+    G_WARN="${G_WARN}${what} could not read ${cnt} item(s), e.g. ${ex}; "; return 0
+  fi
+  for ok in "$@"; do [ "$rc" -eq "$ok" ] && return 0; done
+  G_WARN="${G_WARN}${what} failed (rc=${rc}); "
+}
 NOTES=""
 exists_list() {  # args: candidate paths; prints the ones that exist (symlinks replaced by their targets, directories too)
   local p t
@@ -216,15 +230,17 @@ while IFS= read -r r; do venv_roots+=("$r"); done < <(
   for r in ${proj_roots[@]+"${proj_roots[@]}"}; do printf '%s\n' "$r"; done)
 : > "$TMP/cfgs"
 if [ "${#venv_roots[@]}" -gt 0 ]; then
-  run_to find "${venv_roots[@]}" -maxdepth 7 \( -name node_modules -o -name .git \) -prune -o -name pyvenv.cfg -type f -print > "$TMP/cfgs" 2>/dev/null
-  [ "$?" -eq 124 ] && G_WARN="${G_WARN}Python environment search timed out; "
+  run_to find "${venv_roots[@]}" -maxdepth 7 \( -name node_modules -o -name .git \) -prune -o -name pyvenv.cfg -type f -print > "$TMP/cfgs" 2>"$TMP/err_venv"
+  scan_ok "$?" "Python environment search" "$TMP/err_venv" 0
 fi
 : > "$TMP/broken"
 while IFS= read -r cfg; do
   [ -f "$cfg" ] || continue
+  [ -r "$cfg" ] || { printf 'pyvenv: %s: not readable\n' "$cfg" >> "$TMP/err_cfgread"; continue; }
   h=$(grep -E '^home *= *' "$cfg" | head -1 | sed -E 's/^home *= *//')
   case "$h" in "${PREFIX}/"*) [ -e "$h" ] || printf '%s%s%s\n' "$(dirname "$cfg")" "$US" "$h" >> "$TMP/broken" ;; esac
 done < "$TMP/cfgs"
+scan_ok 0 "Python environment read" "$TMP/err_cfgread" 0
 
 # ── step 3: config files and scripts (file names only, never contents); symlinks resolved to their targets ──
 text_roots=()
@@ -241,20 +257,24 @@ while IFS= read -r r; do text_roots+=("$r"); done < <(exists_list \
   "$HOME/.cargo/config" "$HOME/.cargo/config.toml" "$HOME/.R" "$HOME/.docker" "$HOME/.colima" "$HOME/.lima" \
   /etc/paths /etc/paths.d ${extra_roots[@]+"${extra_roots[@]}"})
 # editors (VS Code / Cursor / VSCodium / Windsurf): settings files only — workspaceStorage/globalStorage are chat logs and databases
-while IFS= read -r x; do text_roots+=("$x"); done < <(for ed in Code Cursor VSCodium Windsurf; do u="$HOME/Library/Application Support/${ed}/User"; [ -d "$u" ] && find "$u" -maxdepth 3 \( -name workspaceStorage -o -name globalStorage -o -name History \) -prune -o \( -name settings.json -o -name tasks.json -o -name mcp.json -o -name launch.json \) -type f -print 2>/dev/null; done)
+while IFS= read -r x; do text_roots+=("$x"); done < <(for ed in Code Cursor VSCodium Windsurf; do u="$HOME/Library/Application Support/${ed}/User"; [ -d "$u" ] && find "$u" -maxdepth 3 \( -name workspaceStorage -o -name globalStorage -o -name History \) -prune -o \( -name settings.json -o -name tasks.json -o -name mcp.json -o -name launch.json \) -type f -print 2>>"$TMP/err_editors"; done)
+scan_ok 0 "editor settings search" "$TMP/err_editors" 0
 # git hooks: <project>/.git/hooks/* (pre-commit hard-codes the Python it was installed with) and a global core.hooksPath
 : > "$TMP/hookfiles"
 if [ "${#proj_roots[@]}" -gt 0 ]; then
-  run_to find "${proj_roots[@]}" -maxdepth 6 \( -name node_modules -o -name .venv -o -name venv \) -prune -o -type d -name .git -print -prune 2>/dev/null \
-    | while IFS= read -r g; do [ -d "$g/hooks" ] && find "$g/hooks" -maxdepth 1 -type f ! -name '*.sample' 2>/dev/null; done > "$TMP/hookdirs"
-  [ "${PIPESTATUS[0]}" -eq 124 ] && G_WARN="${G_WARN}git hook search timed out; "
+  run_to find "${proj_roots[@]}" -maxdepth 6 \( -name node_modules -o -name .venv -o -name venv \) -prune -o -type d -name .git -print -prune 2>"$TMP/err_gitdirs" \
+    | while IFS= read -r g; do [ -d "$g/hooks" ] && find "$g/hooks" -maxdepth 1 -type f ! -name '*.sample' 2>>"$TMP/err_hooks"; done > "$TMP/hookdirs"
+  scan_ok "${PIPESTATUS[0]}" "git hook search" "$TMP/err_gitdirs" 0
+  scan_ok 0 "git hook folder listing" "$TMP/err_hooks" 0
   cat "$TMP/hookdirs" >> "$TMP/hookfiles"
 fi
 if command -v git >/dev/null 2>&1; then
   hp=$(git config --global core.hooksPath 2>/dev/null || true)
   # shellcheck disable=SC2088  # literal leading "~/" as git prints it, expanded by hand
   case "$hp" in "~/"*) hp="$HOME/${hp#\~/}" ;; esac
-  [ -n "$hp" ] && [ -d "$hp" ] && find "$hp" -maxdepth 1 -type f ! -name '*.sample' 2>/dev/null >> "$TMP/hookfiles"
+  if [ -n "$hp" ] && [ -d "$hp" ]; then
+    find "$hp" -maxdepth 1 -type f ! -name '*.sample' 2>"$TMP/err_ghooks" >> "$TMP/hookfiles"; scan_ok "$?" "global git hook folder listing" "$TMP/err_ghooks" 0
+  fi
 fi
 while IFS= read -r hf; do [ -n "$hf" ] && text_roots+=("$hf"); done < "$TMP/hookfiles"
 sys_roots=()
@@ -265,8 +285,11 @@ for r in ${sys_roots[@]+"${sys_roots[@]}"}; do [ "$r" = /Applications ] || text_
 plist_files=()
 while IFS= read -r p; do plist_files+=("$p"); done < <(
   for r in "$HOME/Library/LaunchAgents" "$HOME/Library/Services" ${sys_roots[@]+"${sys_roots[@]}"}; do
-    [ -d "$r" ] && [ "$r" != /Applications ] && find "$r" -maxdepth 3 \( -name '*.plist' -o -name '*.wflow' -o -name document.wflow \) \( -type f -o -type l \) 2>/dev/null
+    [ -d "$r" ] && [ "$r" != /Applications ] && find "$r" -maxdepth 3 \( -name '*.plist' -o -name '*.wflow' -o -name document.wflow \) \( -type f -o -type l \) 2>>"$TMP/err_plists"
   done)
+scan_ok 0 "LaunchAgent/Daemon search" "$TMP/err_plists" 0
+for p in ${plist_files[@]+"${plist_files[@]}"}; do [ -e "$p" ] && [ ! -r "$p" ] && printf 'plist: %s: not readable\n' "$p" >> "$TMP/err_plistread"; done
+scan_ok 0 "LaunchAgent/Daemon read" "$TMP/err_plistread" 0
 cron=$(crontab -l 2>/dev/null || true)
 ps_all=$(ps -axo pid=,comm= 2>/dev/null || true)   # executable paths only: full argument strings would match our own command line
 lsof_all=$(run_to lsof -n -Fn 2>/dev/null); lrc=$?
@@ -278,8 +301,9 @@ while IFS= read -r l; do
   t=$(readlink -f "$l" 2>/dev/null); if [ -z "$t" ] || [ ! -e "$t" ]; then t=$(readlink "$l" 2>/dev/null) || continue; printf '%s\t%s\n' "$l" "$t" >> "$TMP/links"; continue; fi   # dangling link: its written target is the evidence
   if [ -d "$t" ]; then printf '%s\t%s/\n' "$l" "$t" >> "$TMP/links"; else printf '%s\t%s\n' "$l" "$t" >> "$TMP/links"
     [ "$(stat -f %z "$t" 2>/dev/null || echo 0)" -le 1048576 ] && text_roots+=("$t"); fi
-done < <(for r in "$HOME/.local" "$HOME/bin" "$HOME/.config" "$HOME/Library/LaunchAgents"; do [ -d "$r" ] && find "$r" -maxdepth 4 -type l 2>/dev/null; done
-         find "$HOME" -maxdepth 1 -name '.*' -type l 2>/dev/null)
+done < <(for r in "$HOME/.local" "$HOME/bin" "$HOME/.config" "$HOME/Library/LaunchAgents"; do [ -d "$r" ] && find "$r" -maxdepth 4 -type l 2>>"$TMP/err_links"; done
+         find "$HOME" -maxdepth 1 -name '.*' -type l 2>>"$TMP/err_links")
+scan_ok 0 "symlink search" "$TMP/err_links" 0
 
 # ── step 4: text files in project folders (one pass for all candidates; ≤1 MB, text, executable/config file types only) ──
 all_pats="$TMP/all"; : > "$all_pats"; all_e="$TMP/alle"; : > "$all_e"
@@ -287,11 +311,11 @@ for ((k=0; k<n; k++)); do [ "${C_SKIP[k]}" = 1 ] || { cat "$TMP/p$k" >> "$all_pa
 : > "$TMP/text_hits"
 if [ "${#text_roots[@]}" -gt 0 ] && [ -s "$all_pats" ]; then
   run_to grep -r -a -o -H -F -f "$all_pats" --exclude='*.bak*' --exclude='*.log' --exclude-dir=logs --exclude-dir=log \
-       --exclude-dir=cache --exclude-dir=Cache --exclude-dir=Caches "${text_roots[@]}" > "$TMP/text_hits" 2>/dev/null
-  [ "$?" -eq 124 ] && G_WARN="${G_WARN}config-file scan timed out; "
+       --exclude-dir=cache --exclude-dir=Cache --exclude-dir=Caches "${text_roots[@]}" > "$TMP/text_hits" 2>"$TMP/err_text"
+  scan_ok "$?" "config-file scan" "$TMP/err_text" 0 1
   run_to grep -r -a -o -H -E -f "$all_e" --exclude='*.bak*' --exclude='*.log' --exclude-dir=logs --exclude-dir=log \
-       --exclude-dir=cache --exclude-dir=Cache --exclude-dir=Caches "${text_roots[@]}" >> "$TMP/text_hits" 2>/dev/null
-  [ "$?" -eq 124 ] && G_WARN="${G_WARN}config-file scan timed out; "
+       --exclude-dir=cache --exclude-dir=Cache --exclude-dir=Caches "${text_roots[@]}" >> "$TMP/text_hits" 2>"$TMP/err_text"
+  scan_ok "$?" "config-file scan" "$TMP/err_text" 0 1
 fi
 # project scan: only file types that get executed or read as configuration (adding *.json/*.js/*.ts pulls in data files: 33 s -> 289 s);
 # matched with a few coarse fragments first (system grep slows down dramatically with many patterns), refined per candidate in step 6.
@@ -311,11 +335,15 @@ if [ "${#proj_roots[@]}" -gt 0 ] && [ -s "$anch" ]; then
     --include='*.rb' --include='Gemfile' --include='*.gemspec' --include='Dockerfile' --include='*.conf' --include='*.service' \
     --include='justfile' --include='Rakefile' --include='Procfile' --include='package.json' --include='settings.json' \
     --include='settings.local.json' --include='tasks.json' --include='launch.json' --include='mcp.json' \
-    "${PEXD[@]}" "${proj_roots[@]}" > "$TMP/proj_hits" 2>/dev/null
-  [ "$?" -eq 124 ] && G_WARN="${G_WARN}project-folder scan timed out; "
+    "${PEXD[@]}" "${proj_roots[@]}" > "$TMP/proj_hits" 2>"$TMP/err_proj"
+  scan_ok "$?" "project-folder scan" "$TMP/err_proj" 0 1
   run_to find "${proj_roots[@]}" \( -name node_modules -o -name .git -o -name .venv -o -name venv -o -name DerivedData -o -name build -o -name dist \) -prune \
-    -o -type f ! -name '*.*' -size -1024k -print0 2>/dev/null > "$TMP/noext"   # extension-less scripts, executable or not (`bash bin/deploy` is common)
-  [ -s "$TMP/noext" ] && xargs -0 grep -I -H -F -f "$piv" < "$TMP/noext" >> "$TMP/proj_hits" 2>/dev/null
+    -o -type f ! -name '*.*' -size -1024k -print0 2>"$TMP/err_noext" > "$TMP/noext"   # extension-less scripts, executable or not (`bash bin/deploy` is common)
+  scan_ok "$?" "extension-less file search" "$TMP/err_noext" 0
+  if [ -s "$TMP/noext" ]; then
+    run_to xargs -0 grep -I -H -F -f "$piv" < "$TMP/noext" >> "$TMP/proj_hits" 2>"$TMP/err_noextg"
+    scan_ok "$?" "extension-less file scan" "$TMP/err_noextg" 0 1 123   # 123 = GNU xargs "some grep found nothing"
+  fi
 fi
 
 # ── step 5: compiled artefacts (Mach-O executables/libraries, .node/.so/.bundle) and symlinks to them; only for candidates that could end up "removable" ──
@@ -338,7 +366,8 @@ if [ -s "$nobin_pats" ]; then
       "$HOME/.local/share/mise" "$HOME/.nvm" "$HOME/.volta" "$HOME/.bun" "$HOME/.gem" "$HOME/.local/share/gem" \
       "${PREFIX}/lib/node_modules" "${PREFIX}/lib/ruby/gems" ${PREFIX}/lib/python3.*/site-packages)
     for r in ${sys_roots[@]+"${sys_roots[@]}"}; do [ "$r" = /Applications ] && bin_roots+=("$r"); done
-    run_to python3 - "$nobin_pats" "$TMP/bin_hits" ${bin_roots[@]+"${bin_roots[@]}"} <<'PY'
+    : > "$TMP/err_bin"
+    run_to python3 - "$nobin_pats" "$TMP/bin_hits" "$TMP/err_bin" ${bin_roots[@]+"${bin_roots[@]}"} <<'PY'
 import os, sys, struct, stat
 # Mach-O files up to 20 MB are matched whole; bigger ones only by the first 512 KB of each architecture slice
 # (linked library paths live in the load commands near the start). Python bytes matching replaces grep -a, which
@@ -347,6 +376,8 @@ import os, sys, struct, stat
 pats = [l.rstrip("\n").encode() for l in open(sys.argv[1], encoding="utf-8") if l.strip()]
 spats = [p.decode() for p in pats]
 out = open(sys.argv[2], "w", encoding="utf-8")
+errs = open(sys.argv[3], "w", encoding="utf-8")   # one line per file or folder that could not be read (path only)
+def err(path, e): errs.write("binary-scan: %s: %s\n" % (path, getattr(e, "strerror", None) or e.__class__.__name__))
 SKIPDIR = {".git", "__pycache__"}
 OKEXT = {"", ".dylib", ".so", ".node", ".bundle", ".plugin"}
 MAGIC = {b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe", b"\xfe\xed\xfa\xcf", b"\xfe\xed\xfa\xce", b"\xca\xfe\xba\xbe", b"\xca\xfe\xba\xbf"}
@@ -376,8 +407,10 @@ def scan(path, st):
                 for p in pats:
                     if p not in found and p in buf: found.add(p)
             for p in found: out.write("%s:%s\n" % (path, p.decode()))
+    except OSError as e:
+        err(path, e)
     except Exception:
-        pass
+        pass   # malformed Mach-O header: nothing more to read
 def link(path):
     try:
         tgt = os.path.realpath(path)
@@ -386,26 +419,25 @@ def link(path):
                 out.write("%s:%s\n" % (path, p)); return
     except Exception:
         pass
-for r in sys.argv[3:]:
+for r in sys.argv[4:]:
     if os.path.isfile(r):
         try: scan(r, os.stat(r))
-        except Exception: pass
+        except OSError as e: err(r, e)
         continue
-    for dp, dns, fns in os.walk(r):
+    for dp, dns, fns in os.walk(r, onerror=lambda e: err(e.filename, e)):
         dns[:] = [d for d in dns if d not in SKIPDIR]
         for fn in fns + [d for d in dns if os.path.islink(os.path.join(dp, d))]:
             p = os.path.join(dp, fn)
             try: st = os.lstat(p)
-            except Exception: continue
+            except OSError as e:
+                err(p, e); continue
             if stat.S_ISLNK(st.st_mode): link(p); continue
             if not stat.S_ISREG(st.st_mode): continue
             ext = os.path.splitext(fn)[1].lower()
             if ext in OKEXT or ext[1:].isdigit() or (st.st_mode & 0o111): scan(p, st)
-out.close()
+out.close(); errs.close()
 PY
-    prc=$?
-    [ "$prc" -eq 124 ] && G_WARN="${G_WARN}binary scan timed out; "
-    [ "$prc" -ne 0 ] && [ "$prc" -ne 124 ] && G_WARN="${G_WARN}binary scan failed (rc=${prc}); "
+    scan_ok "$?" "binary scan" "$TMP/err_bin" 0
   fi
 fi
 
@@ -418,7 +450,7 @@ for ((k=0; k<n; k++)); do
   if [ "${C_CASK[k]}" = 1 ]; then rec "$k" "$f" "$f" cask "" "" 0 0 unknown; continue; fi
   if [ "${C_SKIP[k]}" = 1 ]; then rec "$k" "$f" "$f" not-installed "" "" 0 0 unknown; continue; fi
   pf="$TMP/p$k"; warn="${C_WARN[k]}"
-  hit=""; while IFS= read -r cfg; do [ -f "$cfg" ] && grep -q -F -f "$pf" "$cfg" && hit="${hit}$(dirname "$cfg")"$'\n'; done < "$TMP/cfgs"
+  hit=""; while IFS= read -r cfg; do [ -f "$cfg" ] && grep -q -F -f "$pf" "$cfg" 2>/dev/null && hit="${hit}$(dirname "$cfg")"$'\n'; done < "$TMP/cfgs"
   [ -n "$hit" ] && while IFS= read -r x; do add_ev python-env "$x"; done <<< "$hit"
   th=$({ grep -F -f "$pf" "$TMP/text_hits"; grep -E -f "$TMP/e$k" "$TMP/text_hits"; } | cut -d: -f1 | sort -u)
   if [ -n "$th" ]; then
